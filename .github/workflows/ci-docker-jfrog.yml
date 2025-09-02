@@ -1,0 +1,74 @@
+name: CI - Build, Test, Docker Push to JFrog, Xray Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+env:
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+  JF_URL: ${{ vars.JF_URL }}
+  JF_DOCKER_REPO: ${{ vars.JF_DOCKER_REPO }}
+
+jobs:
+  build-test-push-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build & Test (Maven, central-only)
+        run: |
+          ./mvnw -B -s .github/maven/settings.xml -DskipTests=false clean verify
+
+      - name: Set REGISTRY_HOST from JF_URL
+        run: |
+          echo "REGISTRY_HOST=$(echo "$JF_URL" | sed -e 's#^https\?://##')" >> $GITHUB_ENV
+
+      - name: Set Image Tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+
+      - name: Docker login to Artifactory
+        run: |
+          echo "${{ secrets.JF_ACCESS_TOKEN }}" | docker login -u "${{ secrets.JF_USER }}" --password-stdin "${{ env.REGISTRY_HOST }}"
+
+      - name: Build Docker image
+        run: |
+          docker build -t "${{ env.REGISTRY_HOST }}/${{ env.JF_DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" .
+
+      - name: Push Docker image to Artifactory
+        run: |
+          docker push "${{ env.REGISTRY_HOST }}/${{ env.JF_DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+      - name: Xray scan image (export JSON)
+        env:
+          # ensure the JFrog CLI prints clean JSON only
+          JFROG_CLI_LOG_LEVEL: "ERROR"
+        run: |
+          mkdir -p artifacts
+          jf docker scan "${{ env.REGISTRY_HOST }}/${{ env.JF_DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" --format=json > artifacts/xray-scan.json
+          echo "IMAGE=${{ env.REGISTRY_HOST }}/${{ env.JF_DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" > artifacts/image.txt
+          echo "docker pull ${{ env.REGISTRY_HOST }}/${{ env.JF_DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> artifacts/run-commands.txt
+          echo "docker run -p 8080:8080 ${{ env.REGISTRY_HOST }}/${{ env.JF_DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> artifacts/run-commands.txt
+
+      - name: Upload artifacts (Xray JSON + commands)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-and-run-info
+          path: artifacts/
+
